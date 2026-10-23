@@ -31,7 +31,7 @@ const HTML = `<!doctype html>
 <input id="signed" placeholder="?Signature=...&Key-Pair-Id=...&Policy=...">
 
 <label>License server URL</label>
-<input id="license" placeholder="https://api.penpencil.co/v1/videos/drm-license-manager">
+<input id="license" placeholder="https://license-global.pallycon.com/ri/licenseManager.do">
 
 <label>License token (licenseToken value)</label>
 <input id="token" placeholder="eyJkcm1fdHlwZSI6...">
@@ -42,10 +42,21 @@ const HTML = `<!doctype html>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.10.0/shaka-player.compiled.js"></script>
 <script>
   var logEl = document.getElementById("log");
-  function log(m) { logEl.textContent += m + "\\n"; }
+  var video = document.getElementById("v");
+  function log(m) {
+    var t = video.currentTime ? video.currentTime.toFixed(1) + "s" : "0s";
+    logEl.textContent += "[" + t + "] " + m + "\\n";
+  }
   function val(id) {
     return document.getElementById(id).value.trim().replace(/^["']+|["',]+$/g, "");
   }
+
+  video.addEventListener("waiting", function () { log("video waiting (buffering)"); });
+  video.addEventListener("stalled", function () { log("video stalled"); });
+  video.addEventListener("playing", function () { log("video playing"); });
+  video.addEventListener("error", function () {
+    log("video element error: " + (video.error ? video.error.code + " " + video.error.message : ""));
+  });
 
   var player;
   document.getElementById("go").onclick = async function () {
@@ -61,12 +72,19 @@ const HTML = `<!doctype html>
       var src = location.origin + "/" + encodeURIComponent(signed) + manifest.pathname;
 
       if (player) await player.destroy();
-      var video = document.getElementById("v");
       player = new shaka.Player();
       await player.attach(video);
 
       player.configure({
-        drm: { servers: { "com.widevine.alpha": licenseUrl } }
+        drm: {
+          servers: { "com.widevine.alpha": licenseUrl },
+          retryParameters: { maxAttempts: 3, baseDelay: 500, backoffFactor: 2, fuzzFactor: 0.5, timeout: 0 }
+        },
+        streaming: {
+          bufferingGoal: 30,
+          rebufferingGoal: 2,
+          retryParameters: { maxAttempts: 5, baseDelay: 500, backoffFactor: 2, fuzzFactor: 0.5, timeout: 0 }
+        }
       });
 
       player.getNetworkingEngine().registerRequestFilter(function (type, req) {
@@ -76,13 +94,18 @@ const HTML = `<!doctype html>
       });
 
       player.addEventListener("error", function (e) {
-        log("Player error " + e.detail.code + ": " + (e.detail.message || ""));
+        log("Player error " + e.detail.code + " (category " + e.detail.category + "): " +
+            JSON.stringify(e.detail.data));
+      });
+
+      player.addEventListener("buffering", function (e) {
+        log("shaka buffering: " + e.buffering);
       });
 
       await player.load(src);
       log("Loaded OK");
     } catch (e) {
-      log("Error " + (e.code || "") + ": " + (e.message || e));
+      log("Error " + (e.code || "") + ": " + (e.message || "") + " " + JSON.stringify(e.data || ""));
     }
   };
 </script>
@@ -117,10 +140,17 @@ export default {
     const range = request.headers.get("Range");
     if (range) headers.set("Range", range);
 
-    const res = await fetch(target, { headers });
-    const out = new Headers(res.headers);
-    for (const [k, v] of Object.entries(CORS)) out.set(k, v);
-
-    return new Response(res.body, { status: res.status, headers: out });
+    try {
+      const res = await fetch(target, { method: request.method, headers });
+      const out = new Headers(res.headers);
+      for (const [k, v] of Object.entries(CORS)) out.set(k, v);
+      out.set("X-Origin-Status", String(res.status));
+      return new Response(res.body, { status: res.status, headers: out });
+    } catch (err) {
+      return new Response("Upstream fetch failed: " + err.message, {
+        status: 502,
+        headers: CORS,
+      });
+    }
   },
 };
