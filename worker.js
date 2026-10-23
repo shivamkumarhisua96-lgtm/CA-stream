@@ -1,3 +1,7 @@
+// ====== EDIT THIS ======
+const LICENSE_URL = "https://api.penpencil.co/v1/videos/drm-license-manager";
+// =======================
+
 const ORIGIN = "https://d1d34p8vz63oiq.cloudfront.net";
 
 const CORS = {
@@ -24,17 +28,26 @@ const HTML = `<!doctype html>
 <body>
 <video id="v" controls autoplay playsinline></video>
 
-<label>Manifest URL (the master.mpd URL, without the signed part)</label>
+<label>Manifest URL (master.mpd, without the signed part)</label>
 <input id="manifest" value="https://d1d34p8vz63oiq.cloudfront.net/drm/1a5fa7ae-0c2e-4830-b4bf-c267d5e0001d/master.mpd">
 
 <label>signedUrl (starts with ?Signature=...)</label>
 <input id="signed" placeholder="?Signature=...&Key-Pair-Id=...&Policy=...">
 
-<label>License server URL</label>
-<input id="license" placeholder="https://license-global.pallycon.com/ri/licenseManager.do">
+<label>Authorization token (the YOUR_TOKEN part, without the word Bearer)</label>
+<input id="bearer" placeholder="eyJhbGciOi...">
 
-<label>License token (licenseToken value)</label>
-<input id="token" placeholder="eyJkcm1fdHlwZSI6...">
+<label>client-id</label>
+<input id="clientid" value="5eb393ee95fab7468a79d189">
+
+<label>client-type</label>
+<input id="clienttype" value="WEB">
+
+<label>License token (optional, the licenseToken value)</label>
+<input id="token" placeholder="eyJkcm1fdHlwZSI6... (leave empty if not needed)">
+
+<label>License token header name (used only if the token above is filled)</label>
+<input id="tokenheader" value="pallycon-customdata-v2">
 
 <button id="go">Play</button>
 <div id="log"></div>
@@ -67,8 +80,11 @@ const HTML = `<!doctype html>
 
       var manifest = new URL(val("manifest"));
       var signed = val("signed").replace(/^\\?/, "");
-      var licenseUrl = val("license");
+      var bearer = val("bearer").replace(/^Bearer\\s+/i, "");
+      var clientId = val("clientid");
+      var clientType = val("clienttype");
       var licenseToken = val("token");
+      var tokenHeader = val("tokenheader");
       var src = location.origin + "/" + encodeURIComponent(signed) + manifest.pathname;
 
       if (player) await player.destroy();
@@ -77,8 +93,9 @@ const HTML = `<!doctype html>
 
       player.configure({
         drm: {
-          servers: { "com.widevine.alpha": licenseUrl },
-          retryParameters: { maxAttempts: 3, baseDelay: 500, backoffFactor: 2, fuzzFactor: 0.5, timeout: 0 }
+          // License requests go through the Worker (/license) to avoid CORS problems
+          servers: { "com.widevine.alpha": location.origin + "/license" },
+          retryParameters: { maxAttempts: 2, baseDelay: 500, backoffFactor: 2, fuzzFactor: 0.5, timeout: 0 }
         },
         streaming: {
           bufferingGoal: 30,
@@ -89,7 +106,10 @@ const HTML = `<!doctype html>
 
       player.getNetworkingEngine().registerRequestFilter(function (type, req) {
         if (type === shaka.net.NetworkingEngine.RequestType.LICENSE) {
-          req.headers["pallycon-customdata-v2"] = licenseToken;
+          if (bearer) req.headers["Authorization"] = "Bearer " + bearer;
+          if (clientId) req.headers["client-id"] = clientId;
+          if (clientType) req.headers["client-type"] = clientType;
+          if (licenseToken && tokenHeader) req.headers[tokenHeader] = licenseToken;
         }
       });
 
@@ -112,6 +132,10 @@ const HTML = `<!doctype html>
 </body>
 </html>`;
 
+const SKIP_HEADERS = new Set([
+  "host", "origin", "referer", "content-length", "connection", "accept-encoding",
+]);
+
 export default {
   async fetch(request) {
     if (request.method === "OPTIONS") {
@@ -127,7 +151,30 @@ export default {
       });
     }
 
-    // Proxy: /<encoded-token>/<origin path>
+    // License relay: forwards the player's license request to LICENSE_URL
+    if (url.pathname === "/license") {
+      if (LICENSE_URL.startsWith("PASTE_")) {
+        return new Response("Set LICENSE_URL in worker.js", { status: 500, headers: CORS });
+      }
+      const h = new Headers();
+      for (const [k, v] of request.headers) {
+        const key = k.toLowerCase();
+        if (SKIP_HEADERS.has(key) || key.startsWith("cf-") ||
+            key.startsWith("x-forwarded") || key.startsWith("sec-")) continue;
+        h.set(k, v);
+      }
+      const body = request.method === "POST" ? await request.arrayBuffer() : undefined;
+      try {
+        const res = await fetch(LICENSE_URL, { method: request.method, headers: h, body });
+        const out = new Headers(res.headers);
+        for (const [k, v] of Object.entries(CORS)) out.set(k, v);
+        return new Response(res.body, { status: res.status, headers: out });
+      } catch (err) {
+        return new Response("License fetch failed: " + err.message, { status: 502, headers: CORS });
+      }
+    }
+
+    // Stream proxy: /<encoded-token>/<origin path>
     const [, token, ...rest] = url.pathname.split("/");
     if (!token || !rest.length) {
       return new Response("Bad request", { status: 400, headers: CORS });
